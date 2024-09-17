@@ -1,16 +1,21 @@
 import argparse
-import gc
 import math
 import os
 from multiprocessing import Value
 import toml
 
 from tqdm import tqdm
+
 import torch
+from library.device_utils import init_ipex, clean_memory_on_device
+
+
+init_ipex()
+
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
 from transformers import CLIPTokenizer
-from library import model_util
+from library import deepspeed_utils, model_util
 
 import library.train_util as train_util
 import library.huggingface_util as huggingface_util
@@ -25,7 +30,15 @@ from library.custom_train_functions import (
     prepare_scheduler_for_custom_training,
     scale_v_prediction_loss_like_noise_prediction,
     add_v_prediction_like_loss,
+    apply_debiased_estimation,
+    apply_masked_loss,
 )
+from library.utils import setup_logging, add_logging_arguments
+
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
 
 imagenet_templates_small = [
     "a photo of a {}",
@@ -83,6 +96,7 @@ imagenet_style_templates_small = [
 class TextualInversionTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
+        self.is_sdxl = False
 
     def assert_extra_args(self, args, train_dataset_group):
         pass
@@ -113,7 +127,7 @@ class TextualInversionTrainer:
             accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet, prompt_replacement
         )
 
-    def save_weights(self, file, updated_embs, save_dtype):
+    def save_weights(self, file, updated_embs, save_dtype, metadata):
         state_dict = {"emb_params": updated_embs[0]}
 
         if save_dtype is not None:
@@ -125,7 +139,7 @@ class TextualInversionTrainer:
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
 
-            save_file(state_dict, file)
+            save_file(state_dict, file, metadata)
         else:
             torch.save(state_dict, file)  # can be loaded in Web UI
 
@@ -161,6 +175,7 @@ class TextualInversionTrainer:
 
         train_util.verify_training_args(args)
         train_util.prepare_dataset_args(args, True)
+        setup_logging(args, reset=True)
 
         cache_latents = args.cache_latents
 
@@ -171,7 +186,7 @@ class TextualInversionTrainer:
         tokenizers = tokenizer_or_list if isinstance(tokenizer_or_list, list) else [tokenizer_or_list]
 
         # acceleratorを準備する
-        print("prepare accelerator")
+        logger.info("prepare accelerator")
         accelerator = train_util.prepare_accelerator(args)
 
         # mixed precisionに対応した型を用意しておき適宜castする
@@ -256,7 +271,7 @@ class TextualInversionTrainer:
 
         # データセットを準備する
         if args.dataset_class is None:
-            blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, False, False))
+            blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, False))
             if args.dataset_config is not None:
                 accelerator.print(f"Load dataset config from {args.dataset_config}")
                 user_config = config_util.load_user_config(args.dataset_config)
@@ -281,7 +296,7 @@ class TextualInversionTrainer:
                         ]
                     }
                 else:
-                    print("Train with captions.")
+                    logger.info("Train with captions.")
                     user_config = {
                         "datasets": [
                             {
@@ -304,8 +319,8 @@ class TextualInversionTrainer:
 
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
-        ds_for_collater = train_dataset_group if args.max_data_loader_n_workers == 0 else None
-        collater = train_util.collater_class(current_epoch, current_step, ds_for_collater)
+        ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
+        collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
 
         # make captions: tokenstring tokenstring1 tokenstring2 ...tokenstringn という文字列に書き換える超乱暴な実装
         if use_template:
@@ -345,7 +360,7 @@ class TextualInversionTrainer:
 
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
-        if torch.__version__ >= "2.0.0": # PyTorch 2.0.0 以上対応のxformersなら以下が使える
+        if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
         # 学習を準備する
@@ -356,9 +371,7 @@ class TextualInversionTrainer:
             with torch.no_grad():
                 train_dataset_group.cache_latents(vae, args.vae_batch_size, args.cache_latents_to_disk, accelerator.is_main_process)
             vae.to("cpu")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
+            clean_memory_on_device(accelerator.device)
 
             accelerator.wait_for_everyone()
 
@@ -375,13 +388,13 @@ class TextualInversionTrainer:
         _, _, optimizer = train_util.get_optimizer(args, trainable_params)
 
         # dataloaderを準備する
-        # DataLoaderのプロセス数：0はメインプロセスになる
-        n_workers = min(args.max_data_loader_n_workers, os.cpu_count() - 1)  # cpu_count-1 ただし最大で指定された数まで
+        # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
+        n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset_group,
             batch_size=1,
             shuffle=True,
-            collate_fn=collater,
+            collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
         )
@@ -406,15 +419,11 @@ class TextualInversionTrainer:
             text_encoder_or_list, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
                 text_encoder_or_list, optimizer, train_dataloader, lr_scheduler
             )
-            # transform DDP after prepare
-            text_encoder_or_list, unet = train_util.transform_if_model_is_DDP(text_encoder_or_list, unet)
 
         elif len(text_encoders) == 2:
             text_encoder1, text_encoder2, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
                 text_encoders[0], text_encoders[1], optimizer, train_dataloader, lr_scheduler
             )
-            # transform DDP after prepare
-            text_encoder1, text_encoder2, unet = train_util.transform_if_model_is_DDP(text_encoder1, text_encoder2, unet)
 
             text_encoder_or_list = text_encoders = [text_encoder1, text_encoder2]
 
@@ -433,9 +442,10 @@ class TextualInversionTrainer:
 
             # Freeze all parameters except for the token embeddings in text encoder
             text_encoder.requires_grad_(True)
-            text_encoder.text_model.encoder.requires_grad_(False)
-            text_encoder.text_model.final_layer_norm.requires_grad_(False)
-            text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
+            unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+            unwrapped_text_encoder.text_model.encoder.requires_grad_(False)
+            unwrapped_text_encoder.text_model.final_layer_norm.requires_grad_(False)
+            unwrapped_text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
             # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
 
         unet.requires_grad_(False)
@@ -495,9 +505,13 @@ class TextualInversionTrainer:
 
         if accelerator.is_main_process:
             init_kwargs = {}
+            if args.wandb_run_name:
+                init_kwargs["wandb"] = {"name": args.wandb_run_name}
             if args.log_tracker_config is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
-            accelerator.init_trackers("textual_inversion" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs)
+            accelerator.init_trackers(
+                "textual_inversion" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs
+            )
 
         # function for saving/removing
         def save_model(ckpt_name, embs_list, steps, epoch_no, force_sync_upload=False):
@@ -505,7 +519,10 @@ class TextualInversionTrainer:
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
             accelerator.print(f"\nsaving checkpoint: {ckpt_file}")
-            self.save_weights(ckpt_file, embs_list, save_dtype)
+
+            sai_metadata = train_util.get_sai_model_spec(None, args, self.is_sdxl, False, True)
+
+            self.save_weights(ckpt_file, embs_list, save_dtype, sai_metadata)
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -514,6 +531,20 @@ class TextualInversionTrainer:
             if os.path.exists(old_ckpt_file):
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
+
+        # For --sample_at_first
+        self.sample_images(
+            accelerator,
+            args,
+            0,
+            global_step,
+            accelerator.device,
+            vae,
+            tokenizer_or_list,
+            text_encoder_or_list,
+            unet,
+            prompt_replacement,
+        )
 
         # training loop
         for epoch in range(num_train_epochs):
@@ -530,10 +561,10 @@ class TextualInversionTrainer:
                 with accelerator.accumulate(text_encoders[0]):
                     with torch.no_grad():
                         if "latents" in batch and batch["latents"] is not None:
-                            latents = batch["latents"].to(accelerator.device)
+                            latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
                         else:
                             # latentに変換
-                            latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample()
+                            latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample().to(dtype=weight_dtype)
                         latents = latents * self.vae_scale_factor
 
                     # Get the text embedding for conditioning
@@ -541,7 +572,7 @@ class TextualInversionTrainer:
 
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
-                    noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
+                    noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
                         args, noise_scheduler, latents
                     )
 
@@ -557,24 +588,28 @@ class TextualInversionTrainer:
                     else:
                         target = noise
 
-                    loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c)
+                    if args.masked_loss:
+                        loss = apply_masked_loss(loss, batch)
                     loss = loss.mean([1, 2, 3])
 
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
                     loss = loss * loss_weights
 
                     if args.min_snr_gamma:
-                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
+                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
                     if args.scale_v_pred_loss_like_noise_pred:
                         loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
                     if args.v_pred_like_loss:
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+                    if args.debiased_estimation_loss:
+                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                        params_to_clip = text_encoder.get_input_embeddings().parameters()
+                        params_to_clip = accelerator.unwrap_model(text_encoder).get_input_embeddings().parameters()
                         accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     optimizer.step()
@@ -586,9 +621,11 @@ class TextualInversionTrainer:
                         for text_encoder, orig_embeds_params, index_no_updates in zip(
                             text_encoders, orig_embeds_params_list, index_no_updates_list
                         ):
-                            accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                            # if full_fp16/bf16, input_embeddings_weight is fp16/bf16, orig_embeds_params is fp32
+                            input_embeddings_weight = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight
+                            input_embeddings_weight[index_no_updates] = orig_embeds_params.to(input_embeddings_weight.dtype)[
                                 index_no_updates
-                            ] = orig_embeds_params[index_no_updates]
+                            ]
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
@@ -696,27 +733,29 @@ class TextualInversionTrainer:
         is_main_process = accelerator.is_main_process
         if is_main_process:
             text_encoder = accelerator.unwrap_model(text_encoder)
+            updated_embs = text_encoder.get_input_embeddings().weight[token_ids].data.detach().clone()
 
         accelerator.end_training()
 
-        if args.save_state and is_main_process:
+        if is_main_process and (args.save_state or args.save_state_on_train_end):
             train_util.save_state_on_train_end(args, accelerator)
-
-        updated_embs = text_encoder.get_input_embeddings().weight[token_ids].data.detach().clone()
 
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
             save_model(ckpt_name, updated_embs_list, global_step, num_train_epochs, force_sync_upload=True)
 
-            print("model saved.")
+            logger.info("model saved.")
 
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
+    add_logging_arguments(parser)
     train_util.add_sd_models_arguments(parser)
     train_util.add_dataset_arguments(parser, True, True, False)
     train_util.add_training_arguments(parser, True)
+    train_util.add_masked_loss_arguments(parser)
+    deepspeed_utils.add_deepspeed_arguments(parser)
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser, False)
@@ -729,7 +768,9 @@ def setup_parser() -> argparse.ArgumentParser:
         help="format to save the model (default is .pt) / モデル保存時の形式（デフォルトはpt）",
     )
 
-    parser.add_argument("--weights", type=str, default=None, help="embedding weights to initialize / 学習するネットワークの初期重み")
+    parser.add_argument(
+        "--weights", type=str, default=None, help="embedding weights to initialize / 学習するネットワークの初期重み"
+    )
     parser.add_argument(
         "--num_vectors_per_token", type=int, default=1, help="number of vectors per token / トークンに割り当てるembeddingsの要素数"
     )
@@ -739,7 +780,9 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="token string used in training, must not exist in tokenizer / 学習時に使用されるトークン文字列、tokenizerに存在しない文字であること",
     )
-    parser.add_argument("--init_word", type=str, default=None, help="words to initialize vector / ベクトルを初期化に使用する単語、複数可")
+    parser.add_argument(
+        "--init_word", type=str, default=None, help="words to initialize vector / ベクトルを初期化に使用する単語、複数可"
+    )
     parser.add_argument(
         "--use_object_template",
         action="store_true",
@@ -763,6 +806,7 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
+    train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
 
     trainer = TextualInversionTrainer()
