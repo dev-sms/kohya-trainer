@@ -7,13 +7,16 @@ from typing import List
 from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
 from library import model_util
 from library import sdxl_original_unet
-
+from .utils import setup_logging
+setup_logging()
+import logging
+logger = logging.getLogger(__name__)
 
 VAE_SCALE_FACTOR = 0.13025
-MODEL_VERSION_SDXL_BASE_V0_9 = "sdxl_base_v0-9"
+MODEL_VERSION_SDXL_BASE_V1_0 = "sdxl_base_v1-0"
 
 # Diffusersの設定を読み込むための参照モデル
-DIFFUSERS_REF_MODEL_ID_SDXL = "stabilityai/stable-diffusion-xl-base-0.9"  # アクセス権が必要
+DIFFUSERS_REF_MODEL_ID_SDXL = "stabilityai/stable-diffusion-xl-base-1.0"
 
 DIFFUSERS_SDXL_UNET_CONFIG = {
     "act_fn": "silu",
@@ -100,7 +103,7 @@ def convert_sdxl_text_encoder_2_checkpoint(checkpoint, max_length):
             key = key.replace(".ln_final", ".final_layer_norm")
         # ckpt from comfy has this key: text_model.encoder.text_model.embeddings.position_ids
         elif ".embeddings.position_ids" in key:
-            key = None  # remove this key: make position_ids by ourselves
+            key = None  # remove this key: position_ids is not used in newer transformers
         return key
 
     keys = list(checkpoint.keys())
@@ -126,12 +129,14 @@ def convert_sdxl_text_encoder_2_checkpoint(checkpoint, max_length):
             new_sd[key_pfx + "k_proj" + key_suffix] = values[1]
             new_sd[key_pfx + "v_proj" + key_suffix] = values[2]
 
-    # original SD にはないので、position_idsを追加
-    position_ids = torch.Tensor([list(range(max_length))]).to(torch.int64)
-    new_sd["text_model.embeddings.position_ids"] = position_ids
-
     # logit_scale はDiffusersには含まれないが、保存時に戻したいので別途返す
     logit_scale = checkpoint.get(SDXL_KEY_PREFIX + "logit_scale", None)
+
+    # temporary workaround for text_projection.weight.weight for Playground-v2
+    if "text_projection.weight.weight" in new_sd:
+        logger.info("convert_sdxl_text_encoder_2_checkpoint: convert text_projection.weight.weight to text_projection.weight")
+        new_sd["text_projection.weight"] = new_sd["text_projection.weight.weight"]
+        del new_sd["text_projection.weight.weight"]
 
     return new_sd, logit_scale
 
@@ -160,7 +165,7 @@ def _load_state_dict_on_device(model, state_dict, device, dtype=None):
 
 def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None):
     # model_version is reserved for future use
-    # dtype is reserved for full_fp16/bf16 integration. Text Encoder will remain fp32, because it runs on CPU when caching
+    # dtype is used for full_fp16/bf16 integration. Text Encoder will remain fp32, because it runs on CPU when caching
 
     # Load the state dict
     if model_util.is_safetensors(ckpt_path):
@@ -184,20 +189,20 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         checkpoint = None
 
     # U-Net
-    print("building U-Net")
+    logger.info("building U-Net")
     with init_empty_weights():
         unet = sdxl_original_unet.SdxlUNet2DConditionModel()
 
-    print("loading U-Net from checkpoint")
+    logger.info("loading U-Net from checkpoint")
     unet_sd = {}
     for k in list(state_dict.keys()):
         if k.startswith("model.diffusion_model."):
             unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
-    info = _load_state_dict_on_device(unet, unet_sd, device=map_location)
-    print("U-Net: ", info)
+    info = _load_state_dict_on_device(unet, unet_sd, device=map_location, dtype=dtype)
+    logger.info(f"U-Net: {info}")
 
     # Text Encoders
-    print("building text encoders")
+    logger.info("building text encoders")
 
     # Text Encoder 1 is same to Stability AI's SDXL
     text_model1_cfg = CLIPTextConfig(
@@ -221,7 +226,8 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         # torch_dtype="float32",
         # transformers_version="4.25.0.dev0",
     )
-    text_model1 = CLIPTextModel._from_config(text_model1_cfg)
+    with init_empty_weights():
+        text_model1 = CLIPTextModel._from_config(text_model1_cfg)
 
     # Text Encoder 2 is different from Stability AI's SDXL. SDXL uses open clip, but we use the model from HuggingFace.
     # Note: Tokenizer from HuggingFace is different from SDXL. We must use open clip's tokenizer.
@@ -246,9 +252,10 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         # torch_dtype="float32",
         # transformers_version="4.25.0.dev0",
     )
-    text_model2 = CLIPTextModelWithProjection(text_model2_cfg)
+    with init_empty_weights():
+        text_model2 = CLIPTextModelWithProjection(text_model2_cfg)
 
-    print("loading text encoders from checkpoint")
+    logger.info("loading text encoders from checkpoint")
     te1_sd = {}
     te2_sd = {}
     for k in list(state_dict.keys()):
@@ -257,22 +264,27 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
         elif k.startswith("conditioner.embedders.1.model."):
             te2_sd[k] = state_dict.pop(k)
 
-    info1 = text_model1.load_state_dict(te1_sd)
-    print("text encoder 1:", info1)
+    # 最新の transformers では position_ids を含むとエラーになるので削除 / remove position_ids for latest transformers
+    if "text_model.embeddings.position_ids" in te1_sd:
+        te1_sd.pop("text_model.embeddings.position_ids")
+
+    info1 = _load_state_dict_on_device(text_model1, te1_sd, device=map_location)  # remain fp32
+    logger.info(f"text encoder 1: {info1}")
 
     converted_sd, logit_scale = convert_sdxl_text_encoder_2_checkpoint(te2_sd, max_length=77)
-    info2 = text_model2.load_state_dict(converted_sd)
-    print("text encoder 2:", info2)
+    info2 = _load_state_dict_on_device(text_model2, converted_sd, device=map_location)  # remain fp32
+    logger.info(f"text encoder 2: {info2}")
 
     # prepare vae
-    print("building VAE")
+    logger.info("building VAE")
     vae_config = model_util.create_vae_diffusers_config()
-    vae = AutoencoderKL(**vae_config)  # .to(device)
+    with init_empty_weights():
+        vae = AutoencoderKL(**vae_config)
 
-    print("loading VAE from checkpoint")
+    logger.info("loading VAE from checkpoint")
     converted_vae_checkpoint = model_util.convert_ldm_vae_checkpoint(state_dict, vae_config)
-    info = vae.load_state_dict(converted_vae_checkpoint)
-    print("VAE:", info)
+    info = _load_state_dict_on_device(vae, converted_vae_checkpoint, device=map_location, dtype=dtype)
+    logger.info(f"VAE: {info}")
 
     ckpt_info = (epoch, global_step) if epoch is not None else None
     return text_model1, text_model2, vae, unet, logit_scale, ckpt_info
@@ -468,6 +480,7 @@ def save_stable_diffusion_checkpoint(
     ckpt_info,
     vae,
     logit_scale,
+    metadata,
     save_dtype=None,
 ):
     state_dict = {}
@@ -505,7 +518,7 @@ def save_stable_diffusion_checkpoint(
     new_ckpt["global_step"] = steps
 
     if model_util.is_safetensors(output_file):
-        save_file(state_dict, output_file)
+        save_file(state_dict, output_file, metadata)
     else:
         torch.save(new_ckpt, output_file)
 
